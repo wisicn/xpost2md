@@ -1,0 +1,22 @@
+{
+    "name": "xpost2md",
+    "version": "1.0.0",
+    "description": "Extract full content from X.com articles and convert to markdown",
+    "main": "x_to_markdown.js",
+    "scripts": {
+      "convert": "node x_to_markdown.js"
+    },
+    "keywords": [
+      "x.com",
+      "twitter",
+      "markdown",
+      "converter",
+      "scraper"
+    ],
+    "author": "",
+    "license": "MIT",
+    "dependencies": {
+      "puppeteer": "^22.0.0"
+    }
+  }
+  
