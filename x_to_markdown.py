@@ -432,12 +432,31 @@ def content_to_markdown(data: dict, url: str) -> str:
 def main():
     """Main function to process X.com URL and create markdown file."""
     if len(sys.argv) < 2:
-        print("Usage: python x_to_markdown.py <x.com_url>")
+        print("Usage: python x_to_markdown.py [-o output_dir] <x.com_url>")
         print("\nExample:")
-        print("  python x_to_markdown.py https://x.com/bozhou_ai/status/2011738838767423983")
+        print("  python x_to_markdown.py -o ./out_put https://x.com/bozhou_ai/status/2011738838767423983")
         sys.exit(1)
     
-    url = sys.argv[1]
+    args = sys.argv[1:]
+    output_dir_arg = ""
+    url = ""
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("-o", "--output") and i + 1 < len(args):
+            output_dir_arg = args[i + 1]
+            i += 2
+            continue
+        if not arg.startswith("-") and not url:
+            url = arg
+        i += 1
+
+    if not url:
+        print("Usage: python x_to_markdown.py [-o output_dir] <x.com_url>")
+        print("\nExample:")
+        print("  python x_to_markdown.py -o ./out_put https://x.com/bozhou_ai/status/2011738838767423983")
+        sys.exit(1)
     
     # Validate URL
     if 'x.com' not in url and 'twitter.com' not in url:
@@ -462,10 +481,11 @@ def main():
     filename = build_filename(data, url) + '.md'
     
     # Determine output directory
-    output_dir = Path.home() / 'tmp'
-    if not output_dir.exists() or not output_dir.is_dir():
+    output_dir = Path(output_dir_arg).expanduser().resolve() if output_dir_arg else (Path.home() / 'tmp')
+    if ((not Path.home()) and not output_dir_arg) or not output_dir.exists() or not output_dir.is_dir():
         print(f"\nError: Output directory not found: {output_dir}")
-        print("Please create $HOME/tmp and try again.")
+        if not output_dir_arg:
+            print("Please create $HOME/tmp and try again.")
         sys.exit(1)
 
     # Save to file

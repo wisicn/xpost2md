@@ -43,8 +43,8 @@ function buildFilename(data, url) {
     const handle = (data.handle || '').replace(/^@/, '').trim();
     const handleSlug = sanitizeFilename(handle);
 
-    const match = url.match(/\/status\/(\d+)/);
-    const id = match ? match[1] : '';
+    const match = url.match(/\/status\/(\d+)|\/article\/(\d+)/);
+    const id = match ? (match[1] || match[2]) : '';
 
     if (!slug || slug.length < 3) {
         if (handleSlug && id) return `x_${handleSlug}_${id}`;
@@ -68,8 +68,58 @@ async function extractXContent(url) {
 
     try {
         const page = await browser.newPage();
+        let bestNetworkArticle = { pieces: [], title: '', author: '' };
+        let networkPieces = [];
+        let bestNetworkBody = '';
         await page.setViewport({ width: 1280, height: 720 });
         await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36');
+
+        page.on('response', async (response) => {
+            try {
+                const headers = response.headers() || {};
+                const contentType = headers['content-type'] || '';
+                if (!contentType.includes('application/json')) return;
+                const url = response.url() || '';
+                if (!/graphql|article/i.test(url)) return;
+                const raw = await response.text();
+                const fromRaw = extractArticleBodyFromJsonRaw(raw);
+                if (fromRaw && fromRaw.length >= 200 && fromRaw.length > bestNetworkBody.length) {
+                    bestNetworkBody = fromRaw;
+                }
+                const rawPieces = extractArticlePiecesFromJsonRaw(raw);
+                if (rawPieces.length) {
+                    const seen = new Set(networkPieces);
+                    rawPieces.forEach(piece => {
+                        if (!seen.has(piece)) {
+                            seen.add(piece);
+                            networkPieces.push(piece);
+                        }
+                    });
+                }
+                let data = null;
+                try {
+                    data = JSON.parse(raw);
+                } catch (e) {
+                    data = null;
+                }
+                if (!data) return;
+                const candidate = extractArticlePiecesFromObject(data);
+                if (candidate.pieces && candidate.pieces.length) {
+                    const seen = new Set(networkPieces);
+                    candidate.pieces.forEach(piece => {
+                        if (!seen.has(piece)) {
+                            seen.add(piece);
+                            networkPieces.push(piece);
+                        }
+                    });
+                }
+                if ((candidate.pieces || []).length > (bestNetworkArticle.pieces || []).length) {
+                    bestNetworkArticle = candidate;
+                }
+            } catch (e) {
+                // ignore response parse errors
+            }
+        });
 
         console.log(`Loading URL: ${url}`);
         await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
@@ -93,6 +143,8 @@ async function extractXContent(url) {
             console.log('No article link found, continuing with current view...');
         }
 
+        await waitForArticleContent(page);
+
         // Expand any truncated text after navigation
         await expandAllShowMore(page);
 
@@ -107,6 +159,8 @@ async function extractXContent(url) {
 
         // Expand one more time after scrolling (newly loaded content)
         await expandAllShowMore(page);
+
+        await waitForArticleContent(page);
 
         // Extract content
         console.log('Extracting content...');
@@ -253,6 +307,127 @@ async function extractXContent(url) {
                 });
             }
 
+            // Final fallback: parse JSON-LD articleBody if still short
+            const finalTextLen = result.content
+                .filter(item => item.type === 'text')
+                .reduce((sum, item) => sum + (item.content?.length || 0), 0);
+            if (finalTextLen < 200) {
+                const scripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
+                scripts.forEach(script => {
+                    try {
+                        const data = JSON.parse(script.textContent || '');
+                        const items = Array.isArray(data) ? data : [data];
+                        items.forEach(item => {
+                            const body = item && typeof item === 'object' ? item.articleBody : '';
+                            if (body && typeof body === 'string') {
+                                body.split('\n').map(l => l.trim()).filter(Boolean).forEach(line => {
+                                    if (seenTexts.has(line)) return;
+                                    seenTexts.add(line);
+                                    result.content.push({
+                                        type: 'text',
+                                        tag: 'p',
+                                        content: line
+                                    });
+                                });
+                            }
+                        });
+                    } catch (e) {
+                        // ignore bad JSON
+                    }
+                });
+            }
+
+            // State fallback: extract article body from embedded JSON state
+            const stateTextLen = result.content
+                .filter(item => item.type === 'text')
+                .reduce((sum, item) => sum + (item.content?.length || 0), 0);
+            if (stateTextLen < 200) {
+                const stateObjects = [];
+                if (window.__INITIAL_STATE__) stateObjects.push(window.__INITIAL_STATE__);
+                if (window.__APOLLO_STATE__) stateObjects.push(window.__APOLLO_STATE__);
+                if (window.__NEXT_DATA__) stateObjects.push(window.__NEXT_DATA__);
+
+                const scripts = Array.from(document.querySelectorAll('script'));
+                scripts.forEach(script => {
+                    const type = script.getAttribute('type') || '';
+                    const id = script.getAttribute('id') || '';
+                    const text = script.textContent || '';
+                    if ((type === 'application/json' && text.trim().startsWith('{')) || id === '__NEXT_DATA__') {
+                        try {
+                            stateObjects.push(JSON.parse(text));
+                        } catch (e) {}
+                    } else if (text.includes('__INITIAL_STATE__')) {
+                        const match = text.match(/__INITIAL_STATE__\s*=\s*({[\s\S]*?})\s*;?\s*$/);
+                        if (match) {
+                            try {
+                                stateObjects.push(JSON.parse(match[1]));
+                            } catch (e) {}
+                        }
+                    } else if (text.includes('__APOLLO_STATE__')) {
+                        const match = text.match(/__APOLLO_STATE__\s*=\s*({[\s\S]*?})\s*;?\s*$/);
+                        if (match) {
+                            try {
+                                stateObjects.push(JSON.parse(match[1]));
+                            } catch (e) {}
+                        }
+                    }
+                });
+
+                const candidates = [];
+                const titleCandidates = [];
+                const authorCandidates = [];
+
+                const stack = stateObjects.map(obj => ({ value: obj, key: '' }));
+                while (stack.length) {
+                    const { value, key } = stack.pop();
+                    if (!value) continue;
+                    if (typeof value === 'string') {
+                        const text = value.trim();
+                        if (text.length > 50) {
+                            const newlineCount = (text.match(/\n/g) || []).length;
+                            const score = text.length + newlineCount * 50;
+                            candidates.push({ text, score });
+                        }
+                        if (/title$/i.test(key) && text.length > 5) {
+                            titleCandidates.push(text);
+                        }
+                        if (/(author|byline|name)$/i.test(key) && text.length > 2) {
+                            authorCandidates.push(text);
+                        }
+                        continue;
+                    }
+                    if (typeof value !== 'object') continue;
+                    if (Array.isArray(value)) {
+                        value.forEach((item, idx) => stack.push({ value: item, key }));
+                    } else {
+                        Object.keys(value).forEach(k => {
+                            stack.push({ value: value[k], key: k });
+                        });
+                    }
+                }
+
+                if (!result.title && titleCandidates.length) {
+                    result.title = titleCandidates[0];
+                }
+                if (!result.author && authorCandidates.length) {
+                    result.author = authorCandidates[0];
+                }
+
+                candidates.sort((a, b) => b.score - a.score);
+                const best = candidates[0];
+                if (best && best.text) {
+                    best.text.split('\n').map(l => l.trim()).filter(Boolean).forEach(line => {
+                        if (seenTexts.has(line)) return;
+                        seenTexts.add(line);
+                        result.content.push({
+                            type: 'text',
+                            tag: 'p',
+                            content: line
+                        });
+                    });
+                }
+            }
+
             // Images are extracted in DOM order above
 
             // Extract title
@@ -264,11 +439,56 @@ async function extractXContent(url) {
                 if (tweetText) {
                     const text = tweetText.innerText.trim();
                     result.title = text.split('\n')[0].substring(0, 100);
+                } else {
+                    const ogTitle = document.querySelector('meta[property="og:title"]')?.getAttribute('content') || '';
+                    const docTitle = document.title || '';
+                    result.title = (ogTitle || docTitle || '').trim();
                 }
             }
 
             return result;
         });
+
+        // HTML fallback: extract article body from embedded JSON in page HTML
+        if (!contentData.content || contentData.content.length === 0) {
+            const html = await page.content();
+            const bodyText = extractArticleBodyFromHtml(html);
+            if (bodyText) {
+                contentData.content = bodyText.split('\n').map(l => l.trim()).filter(Boolean).map(line => ({
+                    type: 'text',
+                    tag: 'p',
+                    content: line
+                }));
+            }
+        }
+
+        // Network fallback: use best JSON response candidate
+        if (!contentData.content || contentData.content.length === 0) {
+            if (bestNetworkBody && bestNetworkBody.length >= 200) {
+                const combined = bestNetworkBody;
+                contentData.content = combined.split('\n').map(l => l.trim()).filter(Boolean).map(line => ({
+                    type: 'text',
+                    tag: 'p',
+                    content: line
+                }));
+            } else {
+                const pieces = networkPieces.length ? networkPieces : (bestNetworkArticle.pieces || []);
+                if (pieces.length) {
+                    const combined = pieces.join('\n');
+                    contentData.content = combined.split('\n').map(l => l.trim()).filter(Boolean).map(line => ({
+                        type: 'text',
+                        tag: 'p',
+                        content: line
+                    }));
+                }
+            }
+            if (!contentData.title && bestNetworkArticle.title) {
+                contentData.title = bestNetworkArticle.title;
+            }
+            if (!contentData.author && bestNetworkArticle.author) {
+                contentData.author = bestNetworkArticle.author;
+            }
+        }
 
         await browser.close();
         return contentData;
@@ -279,6 +499,221 @@ async function extractXContent(url) {
     }
 }
 
+/**
+ * Extract a JSON string value by key from HTML, handling escaped quotes
+ */
+function extractJsonStringByKey(html, key) {
+    const needle = `"${key}":"`;
+    const start = html.indexOf(needle);
+    if (start === -1) return '';
+    let i = start + needle.length;
+    let out = '';
+    let escaped = false;
+    while (i < html.length) {
+        const ch = html[i];
+        if (escaped) {
+            out += '\\' + ch;
+            escaped = false;
+        } else if (ch === '\\') {
+            escaped = true;
+        } else if (ch === '"') {
+            break;
+        } else {
+            out += ch;
+        }
+        i += 1;
+    }
+    if (!out) return '';
+    try {
+        return JSON.parse(`"${out}"`);
+    } catch (e) {
+        return out.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
+    }
+}
+
+/**
+ * Try to extract article body text from raw JSON text
+ */
+function extractArticleBodyFromJsonRaw(raw) {
+    if (!raw || raw.indexOf('"') === -1) return '';
+    const keys = ['articleBody', 'article_body', 'article_body_html', 'full_text', 'fullText', 'note_text', 'noteText'];
+    let best = '';
+    for (const key of keys) {
+        const val = extractJsonStringByKey(raw, key);
+        if (val && val.length > best.length) {
+            best = stripHtml(val);
+        }
+    }
+    return best;
+}
+
+/**
+ * Extract ordered article text pieces from raw JSON text
+ */
+function extractArticlePiecesFromJsonRaw(raw) {
+    if (!raw || raw.indexOf('"') === -1) return [];
+    const keys = [
+        'articleBody',
+        'article_body',
+        'article_body_html',
+        'full_text',
+        'fullText',
+        'note_text',
+        'noteText',
+        'text',
+        'content',
+        'paragraph',
+        'section'
+    ];
+    const keyPattern = keys.map(k => k.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&')).join('|');
+    const regex = new RegExp(`"(?:${keyPattern})":"`, 'g');
+    const pieces = [];
+    let match;
+    while ((match = regex.exec(raw)) !== null) {
+        const start = match.index + match[0].length;
+        let i = start;
+        let out = '';
+        let escaped = false;
+        while (i < raw.length) {
+            const ch = raw[i];
+            if (escaped) {
+                out += '\\' + ch;
+                escaped = false;
+            } else if (ch === '\\') {
+                escaped = true;
+            } else if (ch === '"') {
+                break;
+            } else {
+                out += ch;
+            }
+            i += 1;
+        }
+        if (!out) continue;
+        let text = '';
+        try {
+            text = JSON.parse(`"${out}"`);
+        } catch (e) {
+            text = out.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
+        }
+        text = stripHtml(text.trim());
+        if (text.length < 20) continue;
+        if (looksLikeUrl(text)) continue;
+        pieces.push(text);
+    }
+    return pieces;
+}
+
+/**
+ * Try to extract article body text from HTML with JSON-embedded fields
+ */
+function extractArticleBodyFromHtml(html) {
+    const keys = ['articleBody', 'article_body', 'article_body_html', 'full_text', 'fullText'];
+    let best = '';
+    for (const key of keys) {
+        const val = extractJsonStringByKey(html, key);
+        if (val && val.length > best.length) {
+            best = stripHtml(val);
+        }
+    }
+    return best;
+}
+
+/**
+ * Extract article text pieces/title/author from a JSON object
+ */
+function extractArticlePiecesFromObject(obj) {
+    const candidates = [];
+    const titleCandidates = [];
+    const authorCandidates = [];
+
+    const stack = [{ value: obj, key: '', path: '' }];
+    let order = 0;
+    while (stack.length) {
+        const { value, key, path } = stack.pop();
+        if (!value) continue;
+        if (typeof value === 'string') {
+            const text = stripHtml(value.trim());
+            const lowerKey = (key || '').toLowerCase();
+            const lowerPath = (path || '').toLowerCase();
+            if (text.length > 20 && !looksLikeUrl(text)) {
+                const newlineCount = (text.match(/\n/g) || []).length;
+                let score = text.length + newlineCount * 40;
+                if (/article|body|paragraph|section|content|text|note|markdown|html/.test(lowerKey)) score += 80;
+                if (/article|body|paragraph|section|content|text|note|markdown|html/.test(lowerPath)) score += 40;
+                if (/url|link|image|media|avatar|profile|title|name|handle|username|screen_name|id|rest_id|slug/.test(lowerKey)) score -= 80;
+                if (/url|link|image|media|avatar|profile|title|name|handle|username|screen_name|id|rest_id|slug/.test(lowerPath)) score -= 40;
+                if (text.length > 200) score += 50;
+                candidates.push({ text, score, order: order++ });
+            }
+            if (/title$/i.test(key) && text.length > 5) {
+                titleCandidates.push(text);
+            }
+            if (/(author|byline|name)$/i.test(key) && text.length > 2) {
+                authorCandidates.push(text);
+            }
+            continue;
+        }
+        if (typeof value !== 'object') continue;
+        if (Array.isArray(value)) {
+            value.forEach(item => stack.push({ value: item, key, path }));
+        } else {
+            Object.keys(value).forEach(k => {
+                const nextPath = path ? `${path}.${k}` : k;
+                stack.push({ value: value[k], key: k, path: nextPath });
+            });
+        }
+    }
+
+    const maxScore = candidates.reduce((max, c) => Math.max(max, c.score), 0);
+    let minScore = Math.max(60, Math.floor(maxScore * 0.4));
+    candidates.sort((a, b) => a.order - b.order);
+    const pieces = [];
+    const seen = new Set();
+    for (const candidate of candidates) {
+        if (candidate.score < minScore) continue;
+        if (seen.has(candidate.text)) continue;
+        seen.add(candidate.text);
+        pieces.push(candidate.text);
+    }
+    if (pieces.length < 50) {
+        minScore = 20;
+        for (const candidate of candidates) {
+            if (candidate.score < minScore) continue;
+            if (seen.has(candidate.text)) continue;
+            seen.add(candidate.text);
+            pieces.push(candidate.text);
+        }
+    }
+    return {
+        pieces: pieces.slice(0, 200),
+        title: titleCandidates[0] || '',
+        author: authorCandidates[0] || ''
+    };
+}
+
+function stripHtml(text) {
+    if (!text || text.indexOf('<') === -1) return text;
+    return text.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function looksLikeUrl(text) {
+    return /^https?:\/\//i.test(text) || text.includes('http://') || text.includes('https://');
+}
+
+/**
+ * Wait for article body content on /article/ URLs
+ */
+async function waitForArticleContent(page) {
+    try {
+        if (!page.url().includes('/article/')) return;
+        await page.waitForSelector('[data-testid="article-body"], [data-testid="articleBody"], article, main', {
+            timeout: 15000
+        });
+        await delay(500);
+    } catch (e) {
+        // Best-effort wait; ignore timeouts
+    }
+}
 /**
  * Expand any "Show more"/"Read more" truncation controls
  */
@@ -310,9 +745,9 @@ function contentToMarkdown(data, url) {
     // Title
     let title = data.title?.trim() || 'X Article';
     if (!title || title === 'X Article') {
-        const match = url.match(/\/status\/(\d+)/);
+        const match = url.match(/\/status\/(\d+)|\/article\/(\d+)/);
         if (match) {
-            title = `X Article ${match[1]}`;
+            title = `X Article ${match[1] || match[2]}`;
         }
     }
     lines.push(`# ${title}\n`);
@@ -392,13 +827,33 @@ async function main() {
     const args = process.argv.slice(2);
 
     if (args.length === 0) {
-        console.log('Usage: node x_to_markdown.js <x.com_url>');
+        console.log('Usage: node x_to_markdown.js [-o output_dir] <x.com_url>');
         console.log('\nExample:');
-        console.log('  node x_to_markdown.js https://x.com/bozhou_ai/status/2011738838767423983');
+        console.log('  node x_to_markdown.js -o ./out_put https://x.com/bozhou_ai/status/2011738838767423983');
         process.exit(1);
     }
 
-    const url = args[0];
+    let outputDirArg = '';
+    let url = '';
+
+    for (let i = 0; i < args.length; i++) {
+        const arg = args[i];
+        if ((arg === '-o' || arg === '--output') && args[i + 1]) {
+            outputDirArg = args[i + 1];
+            i += 1;
+            continue;
+        }
+        if (!arg.startsWith('-') && !url) {
+            url = arg;
+        }
+    }
+
+    if (!url) {
+        console.log('Usage: node x_to_markdown.js [-o output_dir] <x.com_url>');
+        console.log('\nExample:');
+        console.log('  node x_to_markdown.js -o ./out_put https://x.com/bozhou_ai/status/2011738838767423983');
+        process.exit(1);
+    }
 
     // Validate URL
     if (!url.includes('x.com') && !url.includes('twitter.com')) {
@@ -427,11 +882,15 @@ async function main() {
 
         // Determine output directory
         const homeDir = process.env.HOME || process.env.USERPROFILE || '';
-        const outputDir = path.join(homeDir, 'tmp');
+        const outputDir = outputDirArg
+            ? path.resolve(process.cwd(), outputDirArg)
+            : path.join(homeDir, 'tmp');
 
-        if (!homeDir || !fs.existsSync(outputDir) || !fs.statSync(outputDir).isDirectory()) {
+        if ((!homeDir && !outputDirArg) || !fs.existsSync(outputDir) || !fs.statSync(outputDir).isDirectory()) {
             console.error(`\nError: Output directory not found: ${outputDir}`);
-            console.error('Please create $HOME/tmp and try again.');
+            if (!outputDirArg) {
+                console.error('Please create $HOME/tmp and try again.');
+            }
             process.exit(1);
         }
 

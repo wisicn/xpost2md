@@ -47,26 +47,26 @@ playwright install chromium
 ### Node.js Version
 
 ```bash
-node x_to_markdown.js <x.com_url>
+node x_to_markdown.js [-o output_dir] <x.com_url>
 ```
 
 **Example:**
 ```bash
-node x_to_markdown.js https://x.com/bozhou_ai/status/2011738838767423983
+node x_to_markdown.js -o ./out_put https://x.com/bozhou_ai/status/2011738838767423983
 ```
 
 ### Python Version
 
 ```bash
-python x_to_markdown.py <x.com_url>
+python x_to_markdown.py [-o output_dir] <x.com_url>
 ```
 
 **Example:**
 ```bash
-python x_to_markdown.py https://x.com/bozhou_ai/status/2011738838767423983
+python x_to_markdown.py -o ./out_put https://x.com/bozhou_ai/status/2011738838767423983
 ```
 
-Both versions will create a markdown file named with an English-only, short, no-space slug (derived from the title; falls back to `x_<handle>_<status_id>` when needed) in **$HOME/tmp**. If `$HOME/tmp` does not exist, the script will exit with an error.
+Both versions will create a markdown file named with an English-only, short, no-space slug (derived from the title; falls back to `x_<handle>_<status_id>` when needed) in **$HOME/tmp** by default. You can override this with `-o <output_dir>`. If the output directory does not exist, the script will exit with an error.
 
 ## Output Format
 
