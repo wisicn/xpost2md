@@ -21,15 +21,48 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 
 
 def sanitize_filename(title: str) -> str:
-    """Convert title to a safe filename."""
-    # Remove or replace invalid filename characters
-    safe_title = re.sub(r'[<>:"/\\|?*]', '', title)
-    # Replace spaces and multiple underscores
-    safe_title = re.sub(r'\s+', '_', safe_title)
+    """Convert title to a safe filename (English only, short, no spaces)."""
+    if not title:
+        return ''
+    normalized = title
+    try:
+        normalized = normalized.encode('utf-8', 'ignore').decode('utf-8')
+    except Exception:
+        pass
+    # Normalize accents
+    try:
+        import unicodedata
+        normalized = unicodedata.normalize('NFKD', normalized)
+        normalized = ''.join(ch for ch in normalized if not unicodedata.combining(ch))
+    except Exception:
+        pass
+    # Keep only ASCII letters/digits
+    safe_title = re.sub(r'[^A-Za-z0-9]+', '_', normalized)
     safe_title = re.sub(r'_+', '_', safe_title)
-    # Limit length
-    safe_title = safe_title[:100]
-    return safe_title.strip('_')
+    safe_title = safe_title.strip('_').lower()
+    return safe_title[:60]
+
+
+def build_filename(data: dict, url: str) -> str:
+    title = data.get('title', '') or ''
+    slug = sanitize_filename(title)
+
+    handle = (data.get('handle', '') or '').lstrip('@').strip()
+    handle_slug = sanitize_filename(handle)
+
+    match = re.search(r'/status/(\d+)', url)
+    status_id = match.group(1) if match else ''
+
+    if not slug or len(slug) < 3:
+        if handle_slug and status_id:
+            return f"x_{handle_slug}_{status_id}"
+        if status_id:
+            return f"x_article_{status_id}"
+        if handle_slug:
+            return f"x_{handle_slug}"
+        return "x_article"
+
+    return slug
 
 
 def extract_x_content(url: str, headless: bool = True) -> dict:
@@ -303,8 +336,7 @@ def main():
     markdown_content = content_to_markdown(data, url)
     
     # Generate filename
-    title = data.get('title', 'x_article')
-    filename = sanitize_filename(title) + '.md'
+    filename = build_filename(data, url) + '.md'
     
     # Determine output directory
     output_dir = Path.home() / 'tmp'

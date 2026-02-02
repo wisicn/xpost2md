@@ -66,7 +66,7 @@ python x_to_markdown.py <x.com_url>
 python x_to_markdown.py https://x.com/bozhou_ai/status/2011738838767423983
 ```
 
-Both versions will create a markdown file named after the article title (e.g., `Obsidian零基础教程从入门到精通.md`) in **$HOME/tmp**. If `$HOME/tmp` does not exist, the script will exit with an error.
+Both versions will create a markdown file named with an English-only, short, no-space slug (derived from the title; falls back to `x_<handle>_<status_id>` when needed) in **$HOME/tmp**. If `$HOME/tmp` does not exist, the script will exit with an error.
 
 ## Output Format
 

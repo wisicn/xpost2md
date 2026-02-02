@@ -22,14 +22,38 @@ function delay(ms) {
 
 /**
  * Sanitize title to create a safe filename
+ * English only, short, no spaces
  */
 function sanitizeFilename(title) {
-    return title
-        .replace(/[<>:"/\\|?*]/g, '')
-        .replace(/\s+/g, '_')
+    if (!title) return '';
+    const ascii = title
+        .normalize('NFKD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/[^A-Za-z0-9]+/g, '_')
         .replace(/_+/g, '_')
-        .substring(0, 100)
-        .replace(/^_+|_+$/g, '');
+        .replace(/^_+|_+$/g, '')
+        .toLowerCase();
+    return ascii.substring(0, 60);
+}
+
+function buildFilename(data, url) {
+    const title = data.title || '';
+    let slug = sanitizeFilename(title);
+
+    const handle = (data.handle || '').replace(/^@/, '').trim();
+    const handleSlug = sanitizeFilename(handle);
+
+    const match = url.match(/\/status\/(\d+)/);
+    const id = match ? match[1] : '';
+
+    if (!slug || slug.length < 3) {
+        if (handleSlug && id) return `x_${handleSlug}_${id}`;
+        if (id) return `x_article_${id}`;
+        if (handleSlug) return `x_${handleSlug}`;
+        return 'x_article';
+    }
+
+    return slug;
 }
 
 /**
@@ -303,8 +327,7 @@ async function main() {
         const markdown = contentToMarkdown(data, url);
 
         // Generate filename
-        const title = data.title || 'x_article';
-        const filename = sanitizeFilename(title) + '.md';
+        const filename = buildFilename(data, url) + '.md';
 
         // Determine output directory
         const homeDir = process.env.HOME || process.env.USERPROFILE || '';
