@@ -91,16 +91,53 @@ def extract_x_content(url: str, headless: bool = True) -> dict:
             
             # Wait for content to load
             page.wait_for_timeout(2000)
+
+            # Expand any truncated text before attempting article navigation
+            try:
+                page.evaluate('''() => {
+                    const targets = Array.from(document.querySelectorAll(
+                        '[data-testid="tweet-text-show-more-link"], div[role="button"], span[role="button"], a[role="link"]'
+                    ));
+                    targets.forEach(el => {
+                        const text = (el.innerText || '').trim().toLowerCase();
+                        if (text === 'show more' || text === 'read more' || text === 'see more') {
+                            el.click();
+                        }
+                    });
+                }''')
+                page.wait_for_timeout(500)
+            except Exception:
+                pass
             
             # Try to click "Article" or "Focus mode" link if available
             try:
-                article_link = page.locator('a[href*="/article/"]').first
-                if article_link.is_visible(timeout=3000):
-                    print("Clicking article link for full view...")
-                    article_link.click()
+                article_href = page.evaluate('''() => {
+                    const link = document.querySelector('a[href*="/article/"], a[href*="/i/article/"]');
+                    return link ? link.href : '';
+                }''')
+                if article_href and article_href != page.url:
+                    print("Opening article link for full view...")
+                    page.goto(article_href, wait_until='networkidle', timeout=30000)
                     page.wait_for_timeout(2000)
             except:
                 print("No article link found, continuing with current view...")
+
+            # Expand any truncated text after navigation
+            try:
+                page.evaluate('''() => {
+                    const targets = Array.from(document.querySelectorAll(
+                        '[data-testid="tweet-text-show-more-link"], div[role="button"], span[role="button"], a[role="link"]'
+                    ));
+                    targets.forEach(el => {
+                        const text = (el.innerText || '').trim().toLowerCase();
+                        if (text === 'show more' || text === 'read more' || text === 'see more') {
+                            el.click();
+                        }
+                    });
+                }''')
+                page.wait_for_timeout(500)
+            except Exception:
+                pass
             
             # Scroll to load all content
             print("Scrolling to load all content...")
@@ -110,6 +147,23 @@ def extract_x_content(url: str, headless: bool = True) -> dict:
             
             page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
             page.wait_for_timeout(1000)
+
+            # Expand one more time after scrolling (newly loaded content)
+            try:
+                page.evaluate('''() => {
+                    const targets = Array.from(document.querySelectorAll(
+                        '[data-testid="tweet-text-show-more-link"], div[role="button"], span[role="button"], a[role="link"]'
+                    ));
+                    targets.forEach(el => {
+                        const text = (el.innerText || '').trim().toLowerCase();
+                        if (text === 'show more' || text === 'read more' || text === 'see more') {
+                            el.click();
+                        }
+                    });
+                }''')
+                page.wait_for_timeout(500)
+            except Exception:
+                pass
             
             # Extract content using JavaScript
             print("Extracting content...")
@@ -148,42 +202,111 @@ def extract_x_content(url: str, headless: bool = True) -> dict:
                     }
                 });
                 
-                // Extract main content - try article first, then tweet
-                let container = document.querySelector('article');
-                if (!container) {
-                    container = document.querySelector('[data-testid="tweetText"]')?.closest('article');
-                }
-                if (!container) {
-                    container = document.body;
+                // Extract main content - prefer article containers
+                const candidates = [
+                    document.querySelector('[data-testid="article-body"]'),
+                    document.querySelector('[data-testid="articleBody"]'),
+                    document.querySelector('article'),
+                    document.querySelector('[data-testid="tweetText"]')?.closest('article'),
+                    document.querySelector('main')
+                ].filter(Boolean);
+                let container = candidates[0] || document.body;
+                let maxLen = 0;
+                for (const el of candidates) {
+                    const len = (el.innerText || '').length;
+                    if (len > maxLen) {
+                        maxLen = len;
+                        container = el;
+                    }
                 }
                 
-                // Get all text content with hierarchy
-                const textElements = container.querySelectorAll('h1, h2, h3, h4, p, li, [data-testid="tweetText"]');
+                // Get text and images in DOM order
                 const seenTexts = new Set();
-                
-                textElements.forEach(el => {
-                    const text = el.innerText?.trim();
-                    if (text && text.length > 0 && !seenTexts.has(text)) {
-                        seenTexts.add(text);
+                const seenImages = new Set();
+                const walker = document.createTreeWalker(container, NodeFilter.SHOW_ELEMENT);
+
+                const isSkippable = (el) => {
+                    if (!el) return true;
+                    if (el.getAttribute && el.getAttribute('aria-hidden') === 'true') return true;
+                    const role = el.getAttribute && el.getAttribute('role');
+                    if (role === 'button') return true;
+                    return false;
+                };
+
+                while (walker.nextNode()) {
+                    const el = walker.currentNode;
+                    if (isSkippable(el)) continue;
+                    const tag = el.tagName ? el.tagName.toLowerCase() : '';
+
+                    if (tag === 'img') {
+                        const src = el.getAttribute('src') || '';
+                        if (src && src.includes('pbs.twimg.com') && !seenImages.has(src)) {
+                            const w = el.naturalWidth || el.width || 0;
+                            const h = el.naturalHeight || el.height || 0;
+                            if (w > 100 && h > 100) {
+                                seenImages.add(src);
+                                result.content.push({
+                                    type: 'image',
+                                    src,
+                                    alt: el.getAttribute('alt') || 'Image'
+                                });
+                            }
+                        }
+                        continue;
+                    }
+
+                    if (['h1','h2','h3','h4','h5','h6','p','li','blockquote','pre'].includes(tag)) {
+                        const text = el.innerText?.trim();
+                        if (text && !seenTexts.has(text)) {
+                            seenTexts.add(text);
+                            result.content.push({
+                                type: 'text',
+                                tag,
+                                content: text
+                            });
+                        }
+                        continue;
+                    }
+
+                    if ((tag === 'div' || tag === 'span') && el.children.length === 0) {
+                        const text = el.innerText?.trim();
+                        if (text && !seenTexts.has(text)) {
+                            seenTexts.add(text);
+                            result.content.push({
+                                type: 'text',
+                                tag: 'p',
+                                content: text
+                            });
+                        }
+                    }
+                }
+
+                // Fallback: if we only captured a short summary, use raw innerText lines
+                const totalTextLen = result.content
+                    .filter(item => item.type === 'text')
+                    .reduce((sum, item) => sum + (item.content?.length || 0), 0);
+                if (totalTextLen < 400) {
+                    const articleBody = document.querySelector('[data-testid="article-body"], [data-testid="articleBody"]') || container;
+                    const raw = (articleBody && articleBody.innerText) ? articleBody.innerText : '';
+                    const lines = raw.split('\\n').map(l => l.trim()).filter(Boolean);
+                    lines.forEach(line => {
+                        if (seenTexts.has(line)) return;
+                        let tag = 'p';
+                        let content = line;
+                        if (/^[-•]\\s+/.test(line)) {
+                            tag = 'li';
+                            content = line.replace(/^[-•]\\s+/, '');
+                        }
+                        seenTexts.add(line);
                         result.content.push({
                             type: 'text',
-                            tag: el.tagName.toLowerCase(),
-                            content: text
+                            tag,
+                            content
                         });
-                    }
-                });
+                    });
+                }
                 
-                // Extract images
-                const images = container.querySelectorAll('img[src*="pbs.twimg.com"]');
-                images.forEach(img => {
-                    if (img.width > 100 && img.height > 100) { // Filter out icons
-                        result.content.push({
-                            type: 'image',
-                            src: img.src,
-                            alt: img.alt || ''
-                        });
-                    }
-                });
+                // Images are extracted in DOM order above
                 
                 // Try to extract title from first heading or tweet text
                 const firstHeading = container.querySelector('h1, h2');

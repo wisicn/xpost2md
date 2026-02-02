@@ -75,17 +75,26 @@ async function extractXContent(url) {
         await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
         await delay(2000);
 
+        // Expand any truncated text before attempting article navigation
+        await expandAllShowMore(page);
+
         // Try to click article link if available
         try {
-            const articleLink = await page.$('a[href*="/article/"]');
-            if (articleLink) {
-                console.log('Clicking article link for full view...');
-                await articleLink.click();
+            const articleHref = await page.evaluate(() => {
+                const link = document.querySelector('a[href*="/article/"], a[href*="/i/article/"]');
+                return link ? link.href : '';
+            });
+            if (articleHref && articleHref !== page.url()) {
+                console.log('Opening article link for full view...');
+                await page.goto(articleHref, { waitUntil: 'networkidle2', timeout: 30000 });
                 await delay(2000);
             }
         } catch (e) {
             console.log('No article link found, continuing with current view...');
         }
+
+        // Expand any truncated text after navigation
+        await expandAllShowMore(page);
 
         // Scroll to load all content
         console.log('Scrolling to load all content...');
@@ -95,6 +104,9 @@ async function extractXContent(url) {
         }
         await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
         await delay(1000);
+
+        // Expand one more time after scrolling (newly loaded content)
+        await expandAllShowMore(page);
 
         // Extract content
         console.log('Extracting content...');
@@ -135,51 +147,113 @@ async function extractXContent(url) {
             result.stats = statsText.join(' | ');
 
             // Extract main content
-            let container = document.querySelector('article');
-            if (!container) {
-                container = document.querySelector('[data-testid="tweetText"]')?.closest('article');
-            }
-            if (!container) {
-                container = document.body;
+            const candidates = [
+                document.querySelector('[data-testid="article-body"]'),
+                document.querySelector('[data-testid="articleBody"]'),
+                document.querySelector('article'),
+                document.querySelector('[data-testid="tweetText"]')?.closest('article'),
+                document.querySelector('main')
+            ].filter(Boolean);
+            let container = candidates[0] || document.body;
+            let maxLen = 0;
+            for (const el of candidates) {
+                const len = (el.innerText || '').length;
+                if (len > maxLen) {
+                    maxLen = len;
+                    container = el;
+                }
             }
 
-            // Get all text content with hierarchy
-            const textElements = container.querySelectorAll('h1, h2, h3, h4, h5, h6, p, li, [data-testid="tweetText"], div[lang]');
+            // Get text and images in DOM order
             const seenTexts = new Set();
+            const seenImages = new Set();
+            const walker = document.createTreeWalker(container, NodeFilter.SHOW_ELEMENT);
 
-            textElements.forEach(el => {
-                const text = el.innerText?.trim();
-                if (text && text.length > 0 && !seenTexts.has(text)) {
-                    // Skip if this text is contained in a parent we already added
-                    let skip = false;
-                    for (const seenText of seenTexts) {
-                        if (seenText.includes(text) && seenText.length > text.length) {
-                            skip = true;
-                            break;
+            const isSkippable = (el) => {
+                if (!el) return true;
+                if (el.getAttribute && el.getAttribute('aria-hidden') === 'true') return true;
+                const role = el.getAttribute && el.getAttribute('role');
+                if (role === 'button') return true;
+                return false;
+            };
+
+            while (walker.nextNode()) {
+                const el = walker.currentNode;
+                if (isSkippable(el)) continue;
+
+                const tag = el.tagName ? el.tagName.toLowerCase() : '';
+
+                if (tag === 'img') {
+                    const src = el.getAttribute('src') || '';
+                    if (src && src.includes('pbs.twimg.com') && !seenImages.has(src)) {
+                        const w = el.naturalWidth || el.width || 0;
+                        const h = el.naturalHeight || el.height || 0;
+                        if (w > 100 && h > 100) {
+                            seenImages.add(src);
+                            result.content.push({
+                                type: 'image',
+                                src,
+                                alt: el.getAttribute('alt') || 'Image'
+                            });
                         }
                     }
-                    if (!skip) {
+                    continue;
+                }
+
+                // Semantic blocks
+                if (['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'li', 'blockquote', 'pre'].includes(tag)) {
+                    const text = el.innerText?.trim();
+                    if (text && !seenTexts.has(text)) {
                         seenTexts.add(text);
                         result.content.push({
                             type: 'text',
-                            tag: el.tagName.toLowerCase(),
+                            tag,
+                            content: text
+                        });
+                    }
+                    continue;
+                }
+
+                // Leaf nodes with text (common in X articles)
+                if ((tag === 'div' || tag === 'span') && el.children.length === 0) {
+                    const text = el.innerText?.trim();
+                    if (text && !seenTexts.has(text)) {
+                        seenTexts.add(text);
+                        result.content.push({
+                            type: 'text',
+                            tag: 'p',
                             content: text
                         });
                     }
                 }
-            });
+            }
 
-            // Extract images
-            const images = container.querySelectorAll('img[src*="pbs.twimg.com"]');
-            images.forEach(img => {
-                if (img.width > 100 && img.height > 100) {
+            // Fallback: if we only captured a short summary, use raw innerText lines
+            const totalTextLen = result.content
+                .filter(item => item.type === 'text')
+                .reduce((sum, item) => sum + (item.content?.length || 0), 0);
+            if (totalTextLen < 400) {
+                const articleBody = document.querySelector('[data-testid="article-body"], [data-testid="articleBody"]') || container;
+                const raw = (articleBody && articleBody.innerText) ? articleBody.innerText : '';
+                const lines = raw.split('\n').map(l => l.trim()).filter(Boolean);
+                lines.forEach(line => {
+                    if (seenTexts.has(line)) return;
+                    let tag = 'p';
+                    let content = line;
+                    if (/^[-•]\s+/.test(line)) {
+                        tag = 'li';
+                        content = line.replace(/^[-•]\s+/, '');
+                    }
+                    seenTexts.add(line);
                     result.content.push({
-                        type: 'image',
-                        src: img.src,
-                        alt: img.alt || 'Image'
+                        type: 'text',
+                        tag,
+                        content
                     });
-                }
-            });
+                });
+            }
+
+            // Images are extracted in DOM order above
 
             // Extract title
             const firstHeading = container.querySelector('h1, h2');
@@ -202,6 +276,28 @@ async function extractXContent(url) {
     } catch (error) {
         await browser.close();
         throw error;
+    }
+}
+
+/**
+ * Expand any "Show more"/"Read more" truncation controls
+ */
+async function expandAllShowMore(page) {
+    try {
+        await page.evaluate(() => {
+            const targets = Array.from(document.querySelectorAll(
+                '[data-testid="tweet-text-show-more-link"], div[role="button"], span[role="button"], a[role="link"]'
+            ));
+            targets.forEach(el => {
+                const text = (el.innerText || '').trim().toLowerCase();
+                if (text === 'show more' || text === 'read more' || text === 'see more') {
+                    el.click();
+                }
+            });
+        });
+        await delay(500);
+    } catch (e) {
+        // Best-effort expansion; ignore failures
     }
 }
 
