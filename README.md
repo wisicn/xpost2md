@@ -66,7 +66,7 @@ python x_to_markdown.py <x.com_url>
 python x_to_markdown.py https://x.com/bozhou_ai/status/2011738838767423983
 ```
 
-Both versions will create a markdown file named after the article title (e.g., `Obsidian零基础教程从入门到精通.md`)
+Both versions will create a markdown file named after the article title (e.g., `Obsidian零基础教程从入门到精通.md`) in **$HOME/tmp**. If `$HOME/tmp` does not exist, the script will exit with an error.
 
 ## Output Format
 
@@ -105,7 +105,7 @@ More content...
 2. **Content Loading**: Scrolls through the page to load all dynamic content
 3. **Extraction**: Uses JavaScript to extract text, headings, images, and metadata
 4. **Conversion**: Converts extracted content to properly formatted markdown
-5. **File Creation**: Saves as `<title>.md` in the current directory
+5. **File Creation**: Saves as `<title>.md` in **$HOME/tmp** (errors if the directory is missing)
 
 ## Requirements
 

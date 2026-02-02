@@ -306,12 +306,24 @@ async function main() {
         const title = data.title || 'x_article';
         const filename = sanitizeFilename(title) + '.md';
 
+        // Determine output directory
+        const homeDir = process.env.HOME || process.env.USERPROFILE || '';
+        const outputDir = path.join(homeDir, 'tmp');
+
+        if (!homeDir || !fs.existsSync(outputDir) || !fs.statSync(outputDir).isDirectory()) {
+            console.error(`\nError: Output directory not found: ${outputDir}`);
+            console.error('Please create $HOME/tmp and try again.');
+            process.exit(1);
+        }
+
+        const outputPath = path.join(outputDir, filename);
+
         // Save to file
-        fs.writeFileSync(filename, markdown, 'utf-8');
+        fs.writeFileSync(outputPath, markdown, 'utf-8');
 
         console.log('\n' + '='.repeat(60));
-        console.log(`✓ Successfully created: ${filename}`);
-        console.log(`  File size: ${fs.statSync(filename).size} bytes`);
+        console.log(`✓ Successfully created: ${outputPath}`);
+        console.log(`  File size: ${fs.statSync(outputPath).size} bytes`);
         console.log(`  Content items: ${data.content?.length || 0}`);
         console.log('='.repeat(60) + '\n');
 

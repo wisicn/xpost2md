@@ -306,12 +306,19 @@ def main():
     title = data.get('title', 'x_article')
     filename = sanitize_filename(title) + '.md'
     
+    # Determine output directory
+    output_dir = Path.home() / 'tmp'
+    if not output_dir.exists() or not output_dir.is_dir():
+        print(f"\nError: Output directory not found: {output_dir}")
+        print("Please create $HOME/tmp and try again.")
+        sys.exit(1)
+
     # Save to file
-    output_path = Path(filename)
+    output_path = output_dir / filename
     output_path.write_text(markdown_content, encoding='utf-8')
     
     print(f"\n{'='*60}")
-    print(f"✓ Successfully created: {filename}")
+    print(f"✓ Successfully created: {output_path}")
     print(f"  File size: {output_path.stat().st_size} bytes")
     print(f"  Content items: {len(data.get('content', []))}")
     print(f"{'='*60}\n")
